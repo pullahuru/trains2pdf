@@ -360,3 +360,48 @@ def test_columns_in_time_order_on_shared_rows():
     for row in range(3):
         times = [c.minutes[row] for c in cols if row in c.minutes]
         assert times == sorted(times), f"row {row} out of order"
+
+
+def test_overnight_train_not_moved_before_daytime_trains():
+    """An overnight train reaching a shared station after 03:00 the next day still comes after a
+    daytime train starting there (it reaches the station later, not earlier)."""
+    from models import RouteDefinition, StationRowConfig, StopCall, TrainTrip
+    from datetime import timedelta
+    days = {date(2027, 1, 4) + timedelta(days=i) for i in range(28)}
+
+    def trip(num, calls):
+        stops = [StopCall(code, code, arr, dep, seq)
+                 for seq, (code, arr, dep) in enumerate(calls, start=1)]
+        return TrainTrip(f"T{num}", str(num), "IC", set(days), stops=stops)
+
+    trips = [
+        trip(1, [("A", None, 23 * 60), ("B", 28 * 60, 28 * 60 + 1), ("C", 29 * 60, None)]),
+        trip(2, [("B", None, 14 * 60), ("C", 15 * 60, None)]),
+    ]
+    route = RouteDefinition(table_id="9", title_fi="A - C", title_sv="A - C",
+                            station_rows=[StationRowConfig("A"), StationRowConfig("B"),
+                                          StationRowConfig("C", is_arrival=True)])
+    tc = TableCompiler(max_columns_per_page=10, window=(date(2027, 1, 4), date(2027, 1, 31)))
+    cols = [c for page in tc.compile_route(route, trips) for c in page]
+    assert [c.trip.train_number for c in cols] == ["2", "1"]
+
+
+def test_contradicting_rules_do_not_pull_unrelated_train_out_of_place():
+    """Issue #1 (Lahti, O 1671 before IC 67): a loop of contradicting shared-row rules elsewhere
+    must not move a train ahead of a train it clearly follows on a shared row."""
+    from types import SimpleNamespace
+    from table_compiler import _order_columns
+
+    def col(num, key, minutes):
+        return SimpleNamespace(sort_key=key, minutes=minutes,
+                               trip=SimpleNamespace(train_number=num))
+    # times in minutes after 03:00 (+180 for absolute), rows 0..3
+    o = col("1671", 10, {2: 180 + 115})                  # starts mid-table, low estimate
+    i = col("67", 20, {0: 180 + 60, 2: 180 + 108})       # leaves row 2 before O 1671
+    x = col("1", 30, {0: 180 + 50, 1: 180 + 55})         # x, y, z: overtaking loop, all before IC 67
+    y = col("2", 31, {1: 180 + 56, 3: 180 + 60})
+    z = col("3", 32, {0: 180 + 45, 3: 180 + 65})
+    cols = [o, i, x, y, z]
+    order = [cols[k].trip.train_number for k in _order_columns(cols)]
+    assert order.index("67") < order.index("1671")
+    assert order.index("1") < order.index("67") and order.index("3") < order.index("67")

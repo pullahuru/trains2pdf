@@ -554,52 +554,73 @@ class TableCompiler:
 
 def _order_columns(cols: List[CompiledColumn]) -> List[int]:
     """Column order: by the estimated origin departure (`sort_key`), but two trains that share a
-    table row always appear in the order of their times on the first row they share. The estimate
+    table row appear in the order of their times on the first row they share. The estimate
     alone fails for trains that run faster or slower than usual (issue #1): a slow train can get an
-    earlier key than a train starting mid-table, yet reach that station after it.
+    earlier key than a train starting mid-table, yet reach that station later.
 
-    Pairwise "earlier on the first shared row" constraints are ordered topologically, taking the
-    lowest estimated key whenever there is a choice. Constraints that contradict each other (a
-    cycle) are broken by releasing the waiting column with the lowest key."""
+    Every shared-row rule that agrees with the estimated order holds anyway. The rules that
+    contradict it are applied one by one, the clearest (largest time difference) first, and a rule
+    is skipped only if it would close a loop with rules already applied (overtaking trains can
+    make the rules contradict each other). The result is a topological order that takes the
+    lowest estimated key whenever there is a choice, so one contradiction elsewhere in the table
+    can no longer pull an unrelated train out of place."""
     n = len(cols)
     base = sorted(range(n), key=lambda i: (
         cols[i].sort_key, _num_key(cols[i].trip.train_number)))
     rank = {i: r for r, i in enumerate(base)}
 
-    def local(i: int, row: int) -> int:
-        return (cols[i].minutes[row] - DAY_START_MINUTES) % 1440
+    # Times counted from the 03:00 day start of the day the train *enters* the table, so an
+    # overnight train keeps running past 1440 instead of wrapping to the early morning.
+    day_shift = [((min(c.minutes.values()) - DAY_START_MINUTES) // 1440) * 1440
+                 if c.minutes else 0 for c in cols]
 
-    succ: List[List[int]] = [[] for _ in range(n)]
-    indeg = [0] * n
+    def local(i: int, row: int) -> int:
+        return cols[i].minutes[row] - DAY_START_MINUTES - day_shift[i]
+
+    succ: List[Set[int]] = [set() for _ in range(n)]
+    against: List[Tuple[int, int, int]] = []   # (-time difference, earlier, later)
     for a in range(n):
         for b in range(a + 1, n):
             for row in sorted(cols[a].minutes.keys() & cols[b].minutes.keys()):
                 ta, tb = local(a, row), local(b, row)
                 if ta != tb:
                     first, second = (a, b) if ta < tb else (b, a)
-                    succ[first].append(second)
-                    indeg[second] += 1
+                    if rank[first] < rank[second]:
+                        succ[first].add(second)
+                    else:
+                        against.append((-abs(ta - tb), first, second))
                     break
 
+    def reaches(src: int, dst: int) -> bool:
+        seen, stack = {src}, [src]
+        while stack:
+            for j in succ[stack.pop()]:
+                if j == dst:
+                    return True
+                if j not in seen:
+                    seen.add(j)
+                    stack.append(j)
+        return False
+
+    for _, first, second in sorted(against, key=lambda e: (e[0], rank[e[1]], rank[e[2]])):
+        if not reaches(second, first):
+            succ[first].add(second)
+
+    indeg = [0] * n
+    for i in range(n):
+        for j in succ[i]:
+            indeg[j] += 1
     ready = [(rank[i], i) for i in range(n) if indeg[i] == 0]
     heapq.heapify(ready)
-    done = [False] * n
     order: List[int] = []
-    while len(order) < n:
-        if not ready:  # contradictory constraints: release the lowest-key waiting column
-            i = min((i for i in range(n) if not done[i]), key=rank.__getitem__)
-            indeg[i] = 0
-            heapq.heappush(ready, (rank[i], i))
+    while ready:
         _, i = heapq.heappop(ready)
-        if done[i]:
-            continue
-        done[i] = True
         order.append(i)
         for j in succ[i]:
-            if not done[j]:
-                indeg[j] -= 1
-                if indeg[j] == 0:
-                    heapq.heappush(ready, (rank[j], j))
+            indeg[j] -= 1
+            if indeg[j] == 0:
+                heapq.heappush(ready, (rank[j], j))
+    assert len(order) == n, "column order constraints must be acyclic"
     return order
 
 
